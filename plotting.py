@@ -23,16 +23,19 @@ def plot_histograms(run_id, conf_level=0.99):
     plt.figure(figsize=(12, 16))
     plt.suptitle(f"cos similarity histograms\n({run_id})\n")
     num_layers = count_mean.shape[0]
-    stride = num_layers // 24
-    for i, layer in enumerate(range(stride, num_layers + stride, stride)):
-        idx = layer - 1
+    layers_to_plot = [i if i < 4
+                      else num_layers - 24 + i if i >= 20
+                      else 3 + round((i - 3) * (num_layers - 8) / 16)
+                      for i in range(24)]
+    for i, layer in enumerate(layers_to_plot):
         plt.subplot(6, 4, i + 1)
-        plt.stairs(count_mean[idx], np.linspace(-1, 1, num_bins + 1))
+        plt.stairs(count_mean[layer], np.linspace(-1, 1, num_bins + 1))
         x = np.linspace(-1 + 1 / num_bins, 1 - 1 / num_bins, num_bins)
-        plt.fill_between(x, count_mean[idx] - count_conf[idx], count_mean[idx] + count_conf[idx], alpha=0.5, step="mid")
+        plt.fill_between(x, count_mean[layer] - count_conf[layer], count_mean[layer] + count_conf[layer],
+                         alpha=0.5, step="mid")
         plt.xlim(-1, 1)
         plt.ylim(0, max_density)  # set a consistent y-axis limit
-        plt.title(f"after layer {layer}")
+        plt.title(f"after layer {layer + 1}")
     plt.tight_layout()
     plt.savefig(f"{outdir}/histograms.pdf")
     plt.close()
@@ -49,21 +52,25 @@ def plot_heatmaps(run_id):
         plt.figure(figsize=(12, 16))
         plt.suptitle(f"cos similarity heatmaps\n({run_id})\n")
         num_layers = heatmap_tensor.shape[1]
-        stride = num_layers // 24
-        for i, layer in enumerate(range(stride, num_layers + stride, stride)):
-            sim_matrix = heatmap_tensor[sample, layer - 1, :seq_lens[sample], :seq_lens[sample]]
+        layers_to_plot = [i if i < 4
+                          else num_layers - 24 + i if i >= 20
+                          else 3 + round((i - 3) * (num_layers - 8) / 16)
+                          for i in range(24)]
+        for i, layer in enumerate(layers_to_plot):
+            sim_matrix = heatmap_tensor[sample, layer, :seq_lens[sample], :seq_lens[sample]]
             plt.subplot(6, 4, i + 1)
             plt.imshow(sim_matrix, cmap="coolwarm", vmin=-1, vmax=1)
             plt.colorbar(label="cosine similarity")
             plt.xlabel("token j")
             plt.ylabel("token i")
-            plt.title(f"after layer {layer}")
+            plt.title(f"after layer {layer + 1}")
         plt.tight_layout()
         plt.savefig(f"{outdir}/heatmaps_sample{sample}.pdf")
         plt.close()
 
 
 def plot_tsne(run_id):
+    # TODO assign colours by cluster size decreasing
     for target in ["X", "XX.T"]:
         outdir = f"visualisation/{run_id}/tsne_{target}"
         os.makedirs(outdir, exist_ok=True)
@@ -76,13 +83,16 @@ def plot_tsne(run_id):
             plt.figure(figsize=(12, 16))
             plt.suptitle(f"t-SNE visualisations\n({run_id})\n")
             num_layers = tsne_tensor.shape[1]
-            stride = num_layers // 24
-            for i, layer in enumerate(range(stride, num_layers + stride, stride)):
-                embeds = tsne_tensor[sample, layer - 1, :seq_lens[sample]]
-                labels = labels_tensor[sample, layer - 1, :seq_lens[sample]]
+            layers_to_plot = [i if i < 4
+                              else num_layers - 24 + i if i >= 20
+                              else 3 + round((i - 3) * (num_layers - 8) / 16)
+                              for i in range(24)]
+            for i, layer in enumerate(layers_to_plot):
+                embeds = tsne_tensor[sample, layer, :seq_lens[sample]]
+                labels = labels_tensor[sample, layer, :seq_lens[sample]]
                 plt.subplot(6, 4, i + 1)
                 plt.scatter(embeds[:, 0], embeds[:, 1], s=1, c=labels, cmap="viridis")
-                plt.title(f"after layer {layer}")
+                plt.title(f"after layer {layer + 1}")
                 plt.xlim(-100, 100)
                 plt.ylim(-100, 100)
             plt.tight_layout()
@@ -117,14 +127,17 @@ def plot_clustering(run_id):
             plt.figure(figsize=(12, 16))
             plt.suptitle(f"HDBSCAN cluster sizes\n({run_id})\n")
             num_layers = clustereval_tensor.shape[1]
-            stride = num_layers // 24
-            for i, layer in enumerate(range(stride, num_layers + stride, stride)):
-                labels = labels_tensor[sample, layer - 1, :seq_lens[sample]]
+            layers_to_plot = [i if i < 4
+                              else num_layers - 24 + i if i >= 20
+                              else 3 + round((i - 3) * (num_layers - 8) / 16)
+                              for i in range(24)]
+            for i, layer in enumerate(layers_to_plot):
+                labels = labels_tensor[sample, layer, :seq_lens[sample]]
                 cluster_sizes = np.bincount(labels[labels != -1])  # ignore outlier bin
                 cluster_sizes = np.sort(cluster_sizes)[::-1]  # sort by decreasing size
                 plt.subplot(6, 4, i + 1)
                 plt.bar(range(1, len(cluster_sizes) + 1), cluster_sizes)
-                plt.title(f"after layer {layer}")
+                plt.title(f"after layer {layer + 1}")
                 plt.xlabel("k-th largest cluster")
                 plt.xticks(range(1, len(cluster_sizes) + 1))
                 if i % 4 == 0:
@@ -137,6 +150,6 @@ def plot_clustering(run_id):
 if __name__ == "__main__":
     run_pbar = tqdm(os.listdir("rawsults/"))
     for run_id in run_pbar:
-        for plot_fn in [plot_histograms, plot_heatmaps, plot_clustering, plot_tsne]:
+        for plot_fn in [plot_heatmaps, plot_histograms, plot_clustering, plot_tsne]:
             run_pbar.set_postfix_str(plot_fn.__name__)
             plot_fn(run_id)
