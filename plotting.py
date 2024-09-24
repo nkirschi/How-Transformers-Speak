@@ -39,7 +39,7 @@ def plot_histograms(run_id, conf_level=0.99):
 
 
 def plot_heatmaps(run_id):
-    outdir = f"visualisation/{run_id}"
+    outdir = f"visualisation/{run_id}/heatmaps"
     os.makedirs(outdir, exist_ok=True)
 
     heatmap_tensor = np.load(f"rawsults/{run_id}/sim_matrices.npy")
