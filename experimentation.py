@@ -1,3 +1,4 @@
+import hdbscan
 import numpy as np
 import os
 import pandas as pd
@@ -8,13 +9,14 @@ import torch.nn.functional as F
 from collections import defaultdict
 from datasets import load_dataset
 from hdbscan import HDBSCAN, validity_index
+from itertools import product
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
 from torch.nn import Identity
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+from umap import UMAP
 
 """
 Run various experiments on transformer models.
@@ -27,6 +29,8 @@ d': dimensionality of query/key space
 L: number of layers
 S: sample size
 """
+
+RANDOM_SEED = 1337
 
 
 class FirstKDims(torch.nn.Module):
@@ -60,6 +64,23 @@ def stack_padded(ndarray_list, pad_value=0):
     for i, a in enumerate(ndarray_list):
         stacked_array[i, *[slice(0, a.shape[dim]) for dim in range(a.ndim)]] = a
     return stacked_array
+
+
+def _new_all_points_core_distance(distance_matrix, d=2.0):
+    """
+    Override as hdbscan.validity_index suffers from numerical instability in high dimensions.
+    See https://github.com/scikit-learn-contrib/hdbscan/issues/127 for background.
+    Changes are indicated with !!! comments.
+    """
+    d = np.sqrt(d)  # !!! only scale dimension with root
+    distance_matrix[distance_matrix != 0] = (1.0 / distance_matrix[distance_matrix != 0]) ** d
+    result = distance_matrix.sum(axis=1)
+    result /= distance_matrix.shape[0] - 1
+    result[result != 0] **= (-1.0 / d)  # !!! only operate on non-zero values
+    return result
+
+
+hdbscan.validity.all_points_core_distance = _new_all_points_core_distance
 
 
 def build_model(model_id, random_params, no_dense_layers, num_hidden_layers):
@@ -143,13 +164,12 @@ def extract_queries_and_keys(model):
             raise NotImplementedError("Unsupported model type", model_type)
 
 
-def compute_clustering(data, min_cluster_size=4):
+def compute_clustering(data, min_cluster_size=3):
     metrics = []
     labels = []
     for i, X in enumerate(data):
-        X = StandardScaler().fit_transform(X)  # standardise to prevent numerical issues
-        pca = PCA(n_components=64, random_state=42).fit(X)
-        clustering = HDBSCAN(min_cluster_size).fit(pca.transform(X))
+        X = UMAP(n_components=64, random_state=RANDOM_SEED, n_jobs=1).fit_transform(X)
+        clustering = HDBSCAN(min_cluster_size).fit(X)
         labels.append(clustering.labels_)
         try:
             num_clusters = clustering.labels_.max() + 1
@@ -176,8 +196,8 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
     "cluster_labels_(X|XQᵀKXᵀ).npy": S x L x N
     "t-SNE_embeddings_(X|XQᵀKXᵀ).npy": S x L x N x 2
     """
-    print("EXPERIMENT:", locals())
-    seed_everything(42)  # ensure reproducibility
+    print(locals())
+    seed_everything(RANDOM_SEED)  # ensure reproducibility
 
     model = build_model(model_id, random_params, no_dense_layers, num_hidden_layers)
     tokeniser = AutoTokenizer.from_pretrained(model_id)
@@ -186,7 +206,8 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
     overview_df = pd.DataFrame(columns=["original_text", "tokenised_text", "num_tokens"])
     results = defaultdict(list)  # non-existent keys are initialised with empty list
 
-    for sample_idx in tqdm(range(sample_size), desc="Analysing each sample"):
+    run_pbar = tqdm(range(sample_size), desc="Analysing each sample")
+    for sample_idx in run_pbar:
         # input from dataset
         input, original_text, tokenised_text = get_random_input(dataset, tokeniser)
         overview_df.loc[sample_idx] = (original_text, tokenised_text, input.input_ids.numel())
@@ -197,16 +218,19 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
                          for X in output.hidden_states]
 
         # similarity matrices
-        identities = model.config.num_hidden_layers * [Identity()]  # setting Q = I, K = I
-        sim_matrices_XXt = compute_similarity_matrices(hidden_states[1:], identities, identities)
-        results["similarity_matrices_XXᵀ"].append(np.stack(sim_matrices_XXt))  # shape: L x N x N
-        queries, keys = extract_queries_and_keys(model)  # using the model's actual Q, K
-        sim_matrices_XQtKXt = compute_similarity_matrices(hidden_states[:-1], queries, keys)
-        results["similarity_matrices_XQᵀKXᵀ"].append(np.stack(sim_matrices_XQtKXt))  # shape: L x N x N
+        run_pbar.set_postfix_str("similarities")
+        for target in ["XXᵀ", "XQᵀKXᵀ"]:
+            if target == "XXᵀ":  # set Q = I, K = I
+                queries = keys = model.config.num_hidden_layers * [Identity()]
+            else:  # use the model's actual Q, K
+                queries, keys = extract_queries_and_keys(model)
+            sim_matrices = compute_similarity_matrices(hidden_states[1:], queries, keys)
+            results[f"similarity_matrices_{target}"].append(np.stack(sim_matrices))  # shape: L x N x N
 
         # clustering and t-SNE
+        run_pbar.set_postfix_str("clustering")
         for target in ["X", "XQᵀKXᵀ"]:
-            data = hidden_states if target == "X" else sim_matrices_XQtKXt
+            data = hidden_states if target == "X" else results[f"similarity_matrices_{target}"][-1]
             metrics, labels = compute_clustering(data)
             tsnes = compute_tsne_embeddings(data)
             results[f"cluster_metrics_{target}"].append(np.stack(metrics))  # shape: L x 4
@@ -220,10 +244,25 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
 
 
 if __name__ == "__main__":
+    print("Loading datasets...")
     wikitext = load_dataset("wikitext", "wikitext-103-v1", split="all")
-    # imdb = load_dataset("stanfordnlp/imdb", split="all")
+    imdb = load_dataset("stanfordnlp/imdb", split="all")
 
-    run_experiment(wikitext, "albert-large-v2", sample_size=3)
+    print("Running experiments...")
+    combinations = list(product([None, wikitext, imdb],
+                                ["albert-large-v2", "bert-large-uncased"],
+                                [False, True],
+                                [False, True]))
+    for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
+        print(f"EXPERIMENT {i + 1}/{len(combinations)}")
+        try:
+            run_experiment(dataset,
+                           model_id,
+                           random_params,
+                           no_dense_layers,
+                           num_hidden_layers=72 if model_id == "albert-large-v2" else None)
+        except Exception as e:
+            print("FAILED:", repr(e))
 
     # for dataset in [None, wikitext, imdb]:  # None corresponds to random tokens
     #     for model_id in ["albert-large-v2", "bert-large-uncased"]:
