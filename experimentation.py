@@ -1,16 +1,55 @@
 import numpy as np
 import os
 import pandas as pd
+import random
 import torch
 import torch.nn.functional as F
 
+from collections import defaultdict
 from datasets import load_dataset
-from sklearn.cluster import HDBSCAN
+from hdbscan import HDBSCAN, validity_index
+from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 from torch.nn import Identity
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+"""
+Run various experiments on transformer models.
+
+We use the following shorthand notation in comments:
+
+N: number of tokens
+d: dimensionality of token space
+d': dimensionality of query/key space
+L: number of layers
+S: sample size
+"""
+
+
+class FirstKDims(torch.nn.Module):
+    def __init__(self, module, k):
+        super().__init__()
+        self.module = module
+        self.k = k
+
+    def forward(self, x):
+        return self.module(x)[..., :self.k]
+
+
+def seed_everything(seed):
+    """
+    credit goes to https://gist.github.com/ihoromi4/b681a9088f348942b01711f251e5f964
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
 def stack_padded(ndarray_list, pad_value=0):
@@ -24,7 +63,7 @@ def stack_padded(ndarray_list, pad_value=0):
 
 
 def build_model(model_id, random_params, no_dense_layers, num_hidden_layers):
-    config = AutoConfig.from_pretrained(model_id, num_attention_heads=1)
+    config = AutoConfig.from_pretrained(model_id)
     if num_hidden_layers:  # override depth (only works for models with shared params)
         config.num_hidden_layers = num_hidden_layers
     if random_params:  # initialise params randomly
@@ -50,14 +89,13 @@ def disable_dense_layers(model):
                     model.encoder.layer[i].attention.output.dense.bias.fill_(0.0)
 
 
-def make_outdir(model, dataset, use_queries_and_keys, random_params, no_dense_layers):
-    runid = f"{model.config._name_or_path}"
-    runid += "_uniform-tokens" if dataset is None else "_" + dataset.info.dataset_name
-    runid += "_⟨Qx,Ky⟩" if use_queries_and_keys else "_⟨x,y⟩"
-    runid += "_random-params" if random_params else "_trained-params"
-    runid += "_dense-off" if no_dense_layers else "_dense-on"
-    runid += f"_{model.config.num_hidden_layers}-layers"
-    outdir = f"rawsults/{runid}"
+def make_outdir(model, dataset, random_params, no_dense_layers):
+    run_id = "randomtext" if dataset is None else dataset.info.dataset_name
+    run_id += f"_{model.config._name_or_path}"
+    run_id += f"_params-{'random' if random_params else 'trained'}"
+    run_id += f"_dense-{'off' if no_dense_layers else 'on'}"
+    run_id += f"_layers-{model.config.num_hidden_layers}"
+    outdir = f"rawsults/{run_id}"
     os.makedirs(outdir, exist_ok=True)
     return outdir
 
@@ -77,127 +115,126 @@ def get_random_input(dataset, tokeniser):
     return input, original_text, tokenised_text
 
 
-def compute_correlations(hidden_states, queries, keys):
-    corrs_list = []
+def compute_similarity_matrices(hidden_states, queries, keys):
+    sim_matrices = []
     for X, query, key in zip(hidden_states, queries, keys):
-        Q_unit = F.normalize(query(X), dim=1)  # shape: N x d'
-        K_unit = F.normalize(key(X), dim=1)  # shape: N x d'
-        similarities = torch.matmul(Q_unit, K_unit.transpose(0, 1))  # shape: N x N
-        assert (similarities.abs() < 1 + 1e-5).all()
-        corrs_list.append(similarities.detach())
-    return corrs_list
+        X = torch.from_numpy(X)  # shape: N x d
+        Q_unit = F.normalize(query(X), dim=-1)  # shape: N x d'
+        K_unit = F.normalize(key(X), dim=-1)  # shape: N x d'
+        sim_matrix = torch.matmul(Q_unit, K_unit.transpose(0, 1))  # shape: N x N
+        sim_matrices.append(sim_matrix.numpy(force=True))
+    return sim_matrices
 
 
-def extract_queries_and_keys(model, replace_with_identity=False):
+def extract_queries_and_keys(model):
     num_layers = model.config.num_hidden_layers
-    if replace_with_identity:
-        return num_layers * [Identity()], num_layers * [Identity()]
+    head_ndim = model.config.hidden_size // model.config.num_attention_heads
     model_type = model.config.model_type
     match model_type:
         case "albert":
-            Q = model.encoder.albert_layer_groups[0].albert_layers[0].attention.query
-            K = model.encoder.albert_layer_groups[0].albert_layers[0].attention.key
+            Q = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.query, head_ndim)
+            K = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.key, head_ndim)
             return num_layers * [Q], num_layers * [K]
         case "bert":
-            queries = [l.attention.self.query for l in model.encoder.layer]
-            keys = [l.attention.self.key for l in model.encoder.layer]
+            queries = [FirstKDims(l.attention.self.query, head_ndim) for l in model.encoder.layer]
+            keys = [FirstKDims(l.attention.self.key, head_ndim) for l in model.encoder.layer]
             return queries, keys
         case _:
             raise NotImplementedError("Unsupported model type", model_type)
 
 
-def compute_clustering(hidden_states):
-    clustereval_arrays = []
-    label_arrays = []
-    for X in hidden_states:
-        # median_dist = np.median(pairwise_distances(layer_latent, metric=metric))
-        # eps = median_dist * (3/4 if metric == "euclidean" else 2/3 if metric == "cosine" else None)
-        # clustering = DBSCAN(eps=eps, min_samples=2, metric=metric).fit(layer_latent)
-        X = X.numpy()
-        clusterer = HDBSCAN(min_cluster_size=4)
-        clustering = clusterer.fit(X)
-        label_arrays.append(clustering.labels_)
-
-        num_clusters = clustering.labels_.max() + 1
-        outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
+def compute_clustering(data, min_cluster_size=4):
+    metrics = []
+    labels = []
+    for i, X in enumerate(data):
+        X = StandardScaler().fit_transform(X)  # standardise to prevent numerical issues
+        pca = PCA(n_components=64, random_state=42).fit(X)
+        clustering = HDBSCAN(min_cluster_size).fit(pca.transform(X))
+        labels.append(clustering.labels_)
         try:
-            sil_score = silhouette_score(X, clustering.labels_)
-            cal_score = calinski_harabasz_score(X, clustering.labels_)
-            dav_score = davies_bouldin_score(X, clustering.labels_)
-        except ValueError:  # single-cluster case
-            sil_score = cal_score = dav_score = float("nan")
-        clustereval_arrays.append(np.array([num_clusters, outlier_rate, sil_score, cal_score, dav_score]))
-    return clustereval_arrays, label_arrays
+            num_clusters = clustering.labels_.max() + 1
+            outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
+            silh_score = silhouette_score(X, clustering.labels_)
+            dbcv_score = validity_index(X, clustering.labels_)
+        except ValueError:  # single-cluster case (rarely happens)
+            silh_score = dbcv_score = 1.0  # best possible score
+        metrics.append(np.array([num_clusters, outlier_rate, silh_score, dbcv_score]))
+    return metrics, labels
 
 
-def compute_tsne_embeddings(hidden_states):
-    return [TSNE(n_components=2, perplexity=5).fit_transform(X) for X in hidden_states]
+def compute_tsne_embeddings(data):
+    return [TSNE(n_components=2, perplexity=5).fit_transform(X) for X in data]
 
 
-def run_experiment(dataset, model_id, use_queries_and_keys=False, random_params=False, no_dense_layers=False,
+def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False,
                    num_hidden_layers=None, sample_size=10, num_bins=100):
-    print("EXPERIMENT:")
-    print("\n".join(map(lambda x: f"{x[0]}: {x[1]}", locals().items())))
+    """
+    This function produces artifact in the form of .npy files on the disk with the following shapes:
+
+    "similarity_matrices_((XXᵀ)|(XQᵀKXᵀ)).npy": S x L x N x N
+    "cluster_metrics_(X|XQᵀKXᵀ).npy": S x L x 4
+    "cluster_labels_(X|XQᵀKXᵀ).npy": S x L x N
+    "t-SNE_embeddings_(X|XQᵀKXᵀ).npy": S x L x N x 2
+    """
+    print("EXPERIMENT:", locals())
+    seed_everything(42)  # ensure reproducibility
 
     model = build_model(model_id, random_params, no_dense_layers, num_hidden_layers)
     tokeniser = AutoTokenizer.from_pretrained(model_id)
-    outdir = make_outdir(model, dataset, use_queries_and_keys, random_params, no_dense_layers)
+    outdir = make_outdir(model, dataset, random_params, no_dense_layers)
 
     overview_df = pd.DataFrame(columns=["original_text", "tokenised_text", "num_tokens"])
-    results = {
-                  "histograms": [],
-                  "sim_matrices": []
-              } | {
-                  f"{key}_{target}": []
-                  for key in ["clustereval", "labels", "tsne"] for target in ["X", "XX.T"]
-              }
+    results = defaultdict(list)  # non-existent keys are initialised with empty list
 
     for sample_idx in tqdm(range(sample_size), desc="Analysing each sample"):
+        # input from dataset
         input, original_text, tokenised_text = get_random_input(dataset, tokeniser)
         overview_df.loc[sample_idx] = (original_text, tokenised_text, input.input_ids.numel())
 
+        # output from model
         output = model(**input, output_hidden_states=True)
-        hidden_states = [X.squeeze(0).clone().detach().requires_grad_(False) for X in output.hidden_states[1:]]
-        queries, keys = extract_queries_and_keys(model, replace_with_identity=not use_queries_and_keys)
-        sim_list = compute_correlations(hidden_states, queries, keys)
-
-        # histograms
-        results["histograms"].append(np.stack([
-            np.histogram(correls.flatten(), bins=num_bins, range=(-1, 1), density=True)[0]
-            for correls in sim_list
-        ]))
+        hidden_states = [X.squeeze(0).numpy(force=True)  # shape: N x d
+                         for X in output.hidden_states]
 
         # similarity matrices
-        results["sim_matrices"].append(np.stack(sim_list).astype(np.float16))
+        identities = model.config.num_hidden_layers * [Identity()]  # setting Q = I, K = I
+        sim_matrices_XXt = compute_similarity_matrices(hidden_states[1:], identities, identities)
+        results["similarity_matrices_XXᵀ"].append(np.stack(sim_matrices_XXt))  # shape: L x N x N
+        queries, keys = extract_queries_and_keys(model)  # using the model's actual Q, K
+        sim_matrices_XQtKXt = compute_similarity_matrices(hidden_states[:-1], queries, keys)
+        results["similarity_matrices_XQᵀKXᵀ"].append(np.stack(sim_matrices_XQtKXt))  # shape: L x N x N
 
-        # clustering and T-SNE
-        for target in ["X", "XX.T"]:
-            data = hidden_states if target == "X" else sim_list
-            clustereval_arrays, label_arrays = compute_clustering(data)
-            tsne_arrays = compute_tsne_embeddings(data)
-            results[f"clustereval_{target}"].append(np.stack(clustereval_arrays))
-            results[f"labels_{target}"].append(np.stack(label_arrays))
-            results[f"tsne_{target}"].append(np.stack(tsne_arrays))
+        # clustering and t-SNE
+        for target in ["X", "XQᵀKXᵀ"]:
+            data = hidden_states if target == "X" else sim_matrices_XQtKXt
+            metrics, labels = compute_clustering(data)
+            tsnes = compute_tsne_embeddings(data)
+            results[f"cluster_metrics_{target}"].append(np.stack(metrics))  # shape: L x 4
+            results[f"cluster_labels_{target}"].append(np.stack(labels))  # shape: L x N
+            results[f"t-SNE_embeddings_{target}"].append(np.stack(tsnes))  # L x N x 2
 
     overview_df.to_csv(f"{outdir}/0verview.csv", index_label="sample_idx")
     for key, val in results.items():
-        np.save(f"{outdir}/{key}.npy", stack_padded(val))
+        if val:  # ignore empty lists
+            np.save(f"{outdir}/{key}.npy", stack_padded(val))  # shape: S x previous
 
 
 if __name__ == "__main__":
     wikitext = load_dataset("wikitext", "wikitext-103-v1", split="all")
-    imdb = load_dataset("stanfordnlp/imdb", split="all")
+    # imdb = load_dataset("stanfordnlp/imdb", split="all")
 
-    # for dataset in [None, wikitext, imdb]:
-    #     for model_id in ["albert-xlarge-v2", "bert-large-uncased"]:
-    #         for use_queries_and_keys in [False, True]:
-    #             for random_params in [False, True]:
-    #                 for no_dense_layers in [False, True]:
-    #                     run_experiment(dataset, model_id, use_queries_and_keys, random_params, no_dense_layers)
-    #
-    # for dataset in [None, wikitext, imdb]:
-    #     for use_queries_and_keys in [False, True]:
-    #         run_experiment(dataset, "albert-xlarge-v2", use_queries_and_keys, num_hidden_layers=192)
-    for dataset in [imdb]:
-        for use_queries_and_keys in [False]:
-            run_experiment(dataset, "albert-xlarge-v2", use_queries_and_keys, num_hidden_layers=192)
+    run_experiment(wikitext, "albert-large-v2", sample_size=3)
+
+    # for dataset in [None, wikitext, imdb]:  # None corresponds to random tokens
+    #     for model_id in ["albert-large-v2", "bert-large-uncased"]:
+    #         for random_params in [False, True]:
+    #             for no_dense_layers in [False, True]:
+    #                 try:
+    #                     run_experiment(dataset,
+    #                                    model_id,
+    #                                    random_params,
+    #                                    no_dense_layers,
+    #                                    num_hidden_layers=72 if model_id == "albert-large-v2" else None)
+    #                 except Exception as e:
+    #                     print(">>> FAILED: ", dataset, model_id, random_params, no_dense_layers)
+    #                     print(repr(e))
