@@ -158,7 +158,7 @@ def compute_tsne_embeddings(data):
 def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False,
                    num_hidden_layers=None, sample_size=10, num_bins=100):
     """
-    This function produces artifact in the form of .npy files on the disk with the following shapes:
+    This function produces artifacts in the form of .npy files on the disk with the following shapes:
 
     "(token_similarity|attention_logits).npy": S x L x N x N
     "(token|attention_logit)_cluster_metrics.npy": S x L x 4
