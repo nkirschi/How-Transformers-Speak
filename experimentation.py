@@ -10,13 +10,11 @@ from collections import defaultdict
 from datasets import load_dataset
 from hdbscan import HDBSCAN, validity_index
 from itertools import product
-from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
 from torch.nn import Identity
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
-from umap import UMAP
 
 """
 Run various experiments on transformer models.
@@ -30,7 +28,7 @@ L: number of layers
 S: sample size
 """
 
-RANDOM_SEED = 1337
+RANDOM_SEED = 42
 
 
 class FirstKDims(torch.nn.Module):
@@ -66,23 +64,6 @@ def stack_padded(ndarray_list, pad_value=0):
     return stacked_array
 
 
-def _new_all_points_core_distance(distance_matrix, d=2.0):
-    """
-    Override as hdbscan.validity_index suffers from numerical instability in high dimensions.
-    See https://github.com/scikit-learn-contrib/hdbscan/issues/127 for background.
-    Changes are indicated with !!! comments.
-    """
-    d = np.sqrt(d)  # !!! only scale dimension with root
-    distance_matrix[distance_matrix != 0] = (1.0 / distance_matrix[distance_matrix != 0]) ** d
-    result = distance_matrix.sum(axis=1)
-    result /= distance_matrix.shape[0] - 1
-    result[result != 0] **= (-1.0 / d)  # !!! only operate on non-zero values
-    return result
-
-
-hdbscan.validity.all_points_core_distance = _new_all_points_core_distance
-
-
 def build_model(model_id, random_params, no_dense_layers, num_hidden_layers):
     config = AutoConfig.from_pretrained(model_id)
     if num_hidden_layers:  # override depth (only works for models with shared params)
@@ -108,6 +89,23 @@ def disable_dense_layers(model):
                 with torch.no_grad():
                     model.encoder.layer[i].attention.output.dense.weight.fill_(0.0)
                     model.encoder.layer[i].attention.output.dense.bias.fill_(0.0)
+
+
+def extract_queries_and_keys(model):
+    num_layers = model.config.num_hidden_layers
+    head_ndim = model.config.hidden_size // model.config.num_attention_heads
+    model_type = model.config.model_type
+    match model_type:
+        case "albert":
+            Q = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.query, head_ndim)
+            K = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.key, head_ndim)
+            return num_layers * [Q], num_layers * [K]
+        case "bert":
+            queries = [FirstKDims(l.attention.self.query, head_ndim) for l in model.encoder.layer]
+            keys = [FirstKDims(l.attention.self.key, head_ndim) for l in model.encoder.layer]
+            return queries, keys
+        case _:
+            raise NotImplementedError("Unsupported model type", model_type)
 
 
 def make_outdir(model, dataset, random_params, no_dense_layers):
@@ -147,37 +145,18 @@ def compute_similarity_matrices(hidden_states, queries, keys):
     return sim_matrices
 
 
-def extract_queries_and_keys(model):
-    num_layers = model.config.num_hidden_layers
-    head_ndim = model.config.hidden_size // model.config.num_attention_heads
-    model_type = model.config.model_type
-    match model_type:
-        case "albert":
-            Q = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.query, head_ndim)
-            K = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.key, head_ndim)
-            return num_layers * [Q], num_layers * [K]
-        case "bert":
-            queries = [FirstKDims(l.attention.self.query, head_ndim) for l in model.encoder.layer]
-            keys = [FirstKDims(l.attention.self.key, head_ndim) for l in model.encoder.layer]
-            return queries, keys
-        case _:
-            raise NotImplementedError("Unsupported model type", model_type)
-
-
-def compute_clustering(data, min_cluster_size=3):
+def compute_clustering(data, min_cluster_size=4):
     metrics = []
     labels = []
     for i, X in enumerate(data):
-        X = UMAP(n_components=64, random_state=RANDOM_SEED, n_jobs=1).fit_transform(X)
-        clustering = HDBSCAN(min_cluster_size).fit(X)
+        X = X.astype(np.float64)  # cast to 64-bit floats to avoid numerical issues
+        #X = PCA(n_components=64, random_state=RANDOM_SEED).fit_transform(X)
+        clustering = HDBSCAN().fit(X)
         labels.append(clustering.labels_)
-        try:
-            num_clusters = clustering.labels_.max() + 1
-            outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
-            silh_score = silhouette_score(X, clustering.labels_)
-            dbcv_score = validity_index(X, clustering.labels_)
-        except ValueError:  # single-cluster case (rarely happens)
-            silh_score = dbcv_score = 1.0  # best possible score
+        num_clusters = clustering.labels_.max() + 1
+        outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
+        silh_score = silhouette_score(X, clustering.labels_)
+        dbcv_score = validity_index(X, clustering.labels_)
         metrics.append(np.array([num_clusters, outlier_rate, silh_score, dbcv_score]))
     return metrics, labels
 
@@ -215,7 +194,7 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
         # output from model
         output = model(**input, output_hidden_states=True)
         hidden_states = [X.squeeze(0).numpy(force=True)  # shape: N x d
-                         for X in output.hidden_states]
+                         for X in output.hidden_states[1:]]
 
         # similarity matrices
         run_pbar.set_postfix_str("similarities")
@@ -224,7 +203,7 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
                 queries = keys = model.config.num_hidden_layers * [Identity()]
             else:  # use the model's actual Q, K
                 queries, keys = extract_queries_and_keys(model)
-            sim_matrices = compute_similarity_matrices(hidden_states[1:], queries, keys)
+            sim_matrices = compute_similarity_matrices(hidden_states, queries, keys)
             results[f"similarity_matrices_{target}"].append(np.stack(sim_matrices))  # shape: L x N x N
 
         # clustering and t-SNE
@@ -263,17 +242,3 @@ if __name__ == "__main__":
                            num_hidden_layers=72 if model_id == "albert-large-v2" else None)
         except Exception as e:
             print("FAILED:", repr(e))
-
-    # for dataset in [None, wikitext, imdb]:  # None corresponds to random tokens
-    #     for model_id in ["albert-large-v2", "bert-large-uncased"]:
-    #         for random_params in [False, True]:
-    #             for no_dense_layers in [False, True]:
-    #                 try:
-    #                     run_experiment(dataset,
-    #                                    model_id,
-    #                                    random_params,
-    #                                    no_dense_layers,
-    #                                    num_hidden_layers=72 if model_id == "albert-large-v2" else None)
-    #                 except Exception as e:
-    #                     print(">>> FAILED: ", dataset, model_id, random_params, no_dense_layers)
-    #                     print(repr(e))
