@@ -32,16 +32,6 @@ S: sample size
 RANDOM_SEED = 42
 
 
-class FirstKDims(torch.nn.Module):
-    def __init__(self, module, k):
-        super().__init__()
-        self.module = module
-        self.k = k
-
-    def forward(self, x):
-        return self.module(x)[..., :self.k]
-
-
 def seed_everything(seed):
     """
     credit goes to https://gist.github.com/ihoromi4/b681a9088f348942b01711f251e5f964
@@ -230,30 +220,15 @@ if __name__ == "__main__":
     print("Running experiments...")
     combinations = list(product([None, wikitext, imdb],
                                 ["albert-large-v2", "bert-large-uncased"],
-                                [False],
-                                [False]))
+                                [False, True],
+                                [False, True]))
     for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
         print(f"EXPERIMENT {i + 1}/{len(combinations)}")
         try:
             run_experiment(dataset,
                            model_id,
                            random_params,
-                           no_dense_layers)
+                           no_dense_layers,
+                           num_hidden_layers=72 if model_id == "albert-large-v2" else None)
         except Exception as e:
             print("FAILED:", repr(e))
-
-    # print("Running experiments...")
-    # combinations = list(product([None, wikitext, imdb],
-    #                             ["albert-large-v2", "bert-large-uncased"],
-    #                             [False, True],
-    #                             [False, True]))
-    # for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
-    #     print(f"EXPERIMENT {i + 1}/{len(combinations)}")
-    #     try:
-    #         run_experiment(dataset,
-    #                        model_id,
-    #                        random_params,
-    #                        no_dense_layers,
-    #                        num_hidden_layers=72 if model_id == "albert-large-v2" else None)
-    #     except Exception as e:
-    #         print("FAILED:", repr(e))
