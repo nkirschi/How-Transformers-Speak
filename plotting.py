@@ -9,11 +9,11 @@ from tqdm import tqdm
 
 
 def plot_histograms(run_id, num_bins=100, conf_level=0.99):
-    for target in ["XXᵀ", "XQᵀKXᵀ"]:
-        outdir = f"visualisation/{run_id}/similarities_{target}"
+    for target in ["token_similarity", "attention_logits"]:
+        outdir = f"visualisation/{run_id}/{target}"
         os.makedirs(outdir, exist_ok=True)
 
-        sim_tensor = np.load(f"rawsults/{run_id}/similarity_matrices_{target}.npy")
+        sim_tensor = np.load(f"rawsults/{run_id}/{target}.npy")
         seq_lens = pd.read_csv(f"rawsults/{run_id}/0verview.csv", index_col=0)["num_tokens"]
         count_tensor = np.stack([np.stack([
             np.histogram(layer[:seq_lens[i], :seq_lens[i]].flatten(), bins=num_bins, range=(-1, 1), density=True)[0]
@@ -26,7 +26,7 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
         max_density = count_tensor.max()
 
         plt.figure(figsize=(12, 16))
-        plt.suptitle(f"cos similarity histograms\n({run_id})\n")
+        plt.suptitle(f"{target} histograms\n({run_id})\n")
         num_layers = count_mean.shape[0]
         layers_to_plot = [i if i < 4
                           else num_layers - 24 + i if i >= 20
@@ -47,26 +47,29 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
 
 
 def plot_heatmaps(run_id):
-    for target in ["XXᵀ", "XQᵀKXᵀ"]:
-        outdir = f"visualisation/{run_id}/similarities_{target}"
+    for target in ["token_similarity", "attention_logits"]:
+        outdir = f"visualisation/{run_id}/{target}"
         os.makedirs(outdir, exist_ok=True)
 
-        sim_tensor = np.load(f"rawsults/{run_id}/similarity_matrices_{target}.npy")
+        dotprod_tensor = np.load(f"rawsults/{run_id}/{target}.npy")
         seq_lens = pd.read_csv(f"rawsults/{run_id}/0verview.csv", index_col=0)["num_tokens"]
 
-        for sample in range(sim_tensor.shape[0]):
+        for sample in range(dotprod_tensor.shape[0]):
             plt.figure(figsize=(12, 16))
-            plt.suptitle(f"cos similarity heatmaps\n({run_id})\n")
-            num_layers = sim_tensor.shape[1]
+            plt.suptitle(f"{target} heatmaps\n({run_id})\n")
+            num_layers = dotprod_tensor.shape[1]
             layers_to_plot = [i if i < 4
                               else num_layers - 24 + i if i >= 20
                               else 3 + round((i - 3) * (num_layers - 8) / 16)
                               for i in range(24)]
             for i, layer in enumerate(layers_to_plot):
-                sim_matrix = sim_tensor[sample, layer, :seq_lens[sample], :seq_lens[sample]]
+                dotprod_matrix = dotprod_tensor[sample, layer, :seq_lens[sample], :seq_lens[sample]]
                 plt.subplot(6, 4, i + 1)
-                plt.imshow(sim_matrix, cmap="coolwarm", vmin=-1, vmax=1)
-                plt.colorbar(label="cosine similarity")
+                if target == "token_similarity":
+                    plt.imshow(dotprod_matrix, vmin=-1, vmax=1, cmap="coolwarm")
+                else:
+                    plt.imshow(dotprod_matrix, cmap="viridis")
+                plt.colorbar(label=f"{target}")
                 plt.xlabel("token j")
                 plt.ylabel("token i")
                 plt.title(f"after layer {layer + 1}")
@@ -76,15 +79,15 @@ def plot_heatmaps(run_id):
 
 
 def plot_cluster_metrics(run_id):
-    for target in ["X", "XQᵀKXᵀ"]:
-        outdir = f"visualisation/{run_id}/clustering_{target}"
+    for target in ["token", "attention_logit"]:
+        outdir = f"visualisation/{run_id}/{target}_clustering"
         os.makedirs(outdir, exist_ok=True)
 
-        metrics_tensor = np.load(f"rawsults/{run_id}/cluster_metrics_{target}.npy")
+        metrics_tensor = np.load(f"rawsults/{run_id}/{target}_cluster_metrics.npy")
 
         for sample in range(metrics_tensor.shape[0]):
-            plt.figure(figsize=(6, 8))
-            plt.suptitle(f"HDBSCAN cluster evaluation\n({run_id})\n")
+            plt.figure(figsize=(12, 8))
+            plt.suptitle(f"HDBSCAN {target} cluster evaluation\n({run_id})\n")
             for i, title in enumerate(["number of clusters", "outlier rate", "Silhouette score", "DBCV score"]):
                 plt.subplot(2, 2, 1 + i)
                 plt.title(title)
@@ -98,17 +101,17 @@ def plot_cluster_metrics(run_id):
 
 
 def plot_cluster_sizes(run_id):
-    for target in ["X", "XQᵀKXᵀ"]:
-        outdir = f"visualisation/{run_id}/clustering_{target}"
+    for target in ["token", "attention_logit"]:
+        outdir = f"visualisation/{run_id}/{target}_clustering"
         os.makedirs(outdir, exist_ok=True)
 
-        metrics_tensor = np.load(f"rawsults/{run_id}/cluster_metrics_{target}.npy")
-        labels_tensor = np.load(f"rawsults/{run_id}/cluster_labels_{target}.npy")
+        metrics_tensor = np.load(f"rawsults/{run_id}/{target}_cluster_metrics.npy")
+        labels_tensor = np.load(f"rawsults/{run_id}/{target}_cluster_labels.npy")
         seq_lens = pd.read_csv(f"rawsults/{run_id}/0verview.csv", index_col=0)["num_tokens"]
 
         for sample in range(metrics_tensor.shape[0]):
             plt.figure(figsize=(12, 16))
-            plt.suptitle(f"HDBSCAN cluster sizes\n({run_id})\n")
+            plt.suptitle(f"HDBSCAN {target} cluster sizes\n({run_id})\n")
             num_layers = metrics_tensor.shape[1]
             layers_to_plot = [i if i < 4
                               else num_layers - 24 + i if i >= 20
@@ -131,17 +134,17 @@ def plot_cluster_sizes(run_id):
             plt.close()
 
 def plot_tsne(run_id):
-    for target in ["X", "XQᵀKXᵀ"]:
-        outdir = f"visualisation/{run_id}/clustering_{target}"
+    for target in ["token", "attention_logit"]:
+        outdir = f"visualisation/{run_id}/{target}_clustering"
         os.makedirs(outdir, exist_ok=True)
 
-        tsne_tensor = np.load(f"rawsults/{run_id}/t-SNE_embeddings_{target}.npy")
-        labels_tensor = np.load(f"rawsults/{run_id}/cluster_labels_{target}.npy")
+        tsne_tensor = np.load(f"rawsults/{run_id}/{target}_t-SNE_embeddings.npy")
+        labels_tensor = np.load(f"rawsults/{run_id}/{target}_cluster_labels.npy")
         seq_lens = pd.read_csv(f"rawsults/{run_id}/0verview.csv", index_col=0)["num_tokens"]
 
         for sample in range(tsne_tensor.shape[0]):
             plt.figure(figsize=(12, 16))
-            plt.suptitle(f"t-SNE visualisations\n({run_id})\n")
+            plt.suptitle(f"{target} t-SNE embeddings\n({run_id})\n")
             num_layers = tsne_tensor.shape[1]
             layers_to_plot = [i if i < 4
                               else num_layers - 24 + i if i >= 20

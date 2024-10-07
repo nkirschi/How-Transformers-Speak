@@ -1,4 +1,3 @@
-import hdbscan
 import numpy as np
 import os
 import pandas as pd
@@ -10,9 +9,10 @@ from collections import defaultdict
 from datasets import load_dataset
 from hdbscan import HDBSCAN, validity_index
 from itertools import product
+
+from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
-from torch.nn import Identity
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -25,6 +25,7 @@ N: number of tokens
 d: dimensionality of token space
 d': dimensionality of query/key space
 L: number of layers
+H: number of attention heads
 S: sample size
 """
 
@@ -91,23 +92,6 @@ def disable_dense_layers(model):
                     model.encoder.layer[i].attention.output.dense.bias.fill_(0.0)
 
 
-def extract_queries_and_keys(model):
-    num_layers = model.config.num_hidden_layers
-    head_ndim = model.config.hidden_size // model.config.num_attention_heads
-    model_type = model.config.model_type
-    match model_type:
-        case "albert":
-            Q = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.query, head_ndim)
-            K = FirstKDims(model.encoder.albert_layer_groups[0].albert_layers[0].attention.key, head_ndim)
-            return num_layers * [Q], num_layers * [K]
-        case "bert":
-            queries = [FirstKDims(l.attention.self.query, head_ndim) for l in model.encoder.layer]
-            keys = [FirstKDims(l.attention.self.key, head_ndim) for l in model.encoder.layer]
-            return queries, keys
-        case _:
-            raise NotImplementedError("Unsupported model type", model_type)
-
-
 def make_outdir(model, dataset, random_params, no_dense_layers):
     run_id = "randomtext" if dataset is None else dataset.info.dataset_name
     run_id += f"_{model.config._name_or_path}"
@@ -134,31 +118,47 @@ def get_random_input(dataset, tokeniser):
     return input, original_text, tokenised_text
 
 
-def compute_similarity_matrices(hidden_states, queries, keys):
+def compute_cos_similarities(hidden_states):
     sim_matrices = []
-    for X, query, key in zip(hidden_states, queries, keys):
+    for X in hidden_states:
         X = torch.from_numpy(X)  # shape: N x d
-        Q_unit = F.normalize(query(X), dim=-1)  # shape: N x d'
-        K_unit = F.normalize(key(X), dim=-1)  # shape: N x d'
-        sim_matrix = torch.matmul(Q_unit, K_unit.transpose(0, 1))  # shape: N x N
+        X_unit = F.normalize(X, dim=-1)  # normalise each row
+        sim_matrix = torch.matmul(X_unit, X_unit.transpose(0, 1))  # shape: N x N
         sim_matrices.append(sim_matrix.numpy(force=True))
     return sim_matrices
 
 
-def compute_clustering(data, min_cluster_size=4):
-    metrics = []
+def compute_attention_logits(attentions):
+    """
+    Obtain the pre-softmax logits up to an additive constant:
+    softmax_i = logit_i /  sum(logits)
+    implies
+    logit_i = log(softmax_i) + C
+    with intractable constant C := log(sum(logits))
+    """
+    logit_matrices = []
+    for A in attentions:
+        A = torch.from_numpy(A)  # shape: H x N x N
+        exp_C = A.min(dim=-1)[0] ** -1
+        logit = torch.log(A * exp_C[..., None])  # scale per head and row
+        logit_matrices.append(logit.numpy(force=True))
+    return logit_matrices
+
+
+def compute_clustering(data):
     labels = []
+    metrics = []
     for i, X in enumerate(data):
         X = X.astype(np.float64)  # cast to 64-bit floats to avoid numerical issues
-        #X = PCA(n_components=64, random_state=RANDOM_SEED).fit_transform(X)
+        X = PCA(n_components=64, random_state=RANDOM_SEED).fit_transform(X)
         clustering = HDBSCAN().fit(X)
-        labels.append(clustering.labels_)
         num_clusters = clustering.labels_.max() + 1
         outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
-        silh_score = silhouette_score(X, clustering.labels_)
+        silh_score = silhouette_score(X, clustering.labels_) if num_clusters > 1 else 1.0
         dbcv_score = validity_index(X, clustering.labels_)
+        labels.append(clustering.labels_)
         metrics.append(np.array([num_clusters, outlier_rate, silh_score, dbcv_score]))
-    return metrics, labels
+    return labels, metrics
 
 
 def compute_tsne_embeddings(data):
@@ -170,10 +170,10 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
     """
     This function produces artifact in the form of .npy files on the disk with the following shapes:
 
-    "similarity_matrices_((XXᵀ)|(XQᵀKXᵀ)).npy": S x L x N x N
-    "cluster_metrics_(X|XQᵀKXᵀ).npy": S x L x 4
-    "cluster_labels_(X|XQᵀKXᵀ).npy": S x L x N
-    "t-SNE_embeddings_(X|XQᵀKXᵀ).npy": S x L x N x 2
+    "(token_similarity|attention_logits).npy": S x L x N x N
+    "(token|attention_logit)_cluster_metrics.npy": S x L x 4
+    "(token|attention_logit)_cluster_labels.npy": S x L x N
+    "(token|attention_logit)_t-SNE_embeddings.npy": S x L x N x 2
     """
     print(locals())
     seed_everything(RANDOM_SEED)  # ensure reproducibility
@@ -192,29 +192,29 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
         overview_df.loc[sample_idx] = (original_text, tokenised_text, input.input_ids.numel())
 
         # output from model
-        output = model(**input, output_hidden_states=True)
+        output = model(**input, output_hidden_states=True, output_attentions=True)
         hidden_states = [X.squeeze(0).numpy(force=True)  # shape: N x d
-                         for X in output.hidden_states[1:]]
+                         for X in output.hidden_states[1:]]  # ignore input layer
+        head = random.choice(range(model.config.num_attention_heads))  # choose random attention head
+        attentions = [A.squeeze(0).numpy(force=True)[head]  # shape: H x N x N
+                      for A in output.attentions]
 
-        # similarity matrices
-        run_pbar.set_postfix_str("similarities")
-        for target in ["XXᵀ", "XQᵀKXᵀ"]:
-            if target == "XXᵀ":  # set Q = I, K = I
-                queries = keys = model.config.num_hidden_layers * [Identity()]
-            else:  # use the model's actual Q, K
-                queries, keys = extract_queries_and_keys(model)
-            sim_matrices = compute_similarity_matrices(hidden_states, queries, keys)
-            results[f"similarity_matrices_{target}"].append(np.stack(sim_matrices))  # shape: L x N x N
+        # dotprod matrices
+        run_pbar.set_postfix_str("dotprods")
+        sim_matrices = compute_cos_similarities(hidden_states)
+        results[f"token_similarity"].append(np.stack(sim_matrices))  # shape: L x N x N
+        logit_matrices = compute_attention_logits(attentions)
+        results[f"attention_logits"].append(np.stack(logit_matrices))  # shape: L x N x N
 
         # clustering and t-SNE
         run_pbar.set_postfix_str("clustering")
-        for target in ["X", "XQᵀKXᵀ"]:
-            data = hidden_states if target == "X" else results[f"similarity_matrices_{target}"][-1]
-            metrics, labels = compute_clustering(data)
+        for target in ["token", "attention_logit"]:
+            data = hidden_states if target == "X" else logit_matrices
+            labels, metrics = compute_clustering(data)
             tsnes = compute_tsne_embeddings(data)
-            results[f"cluster_metrics_{target}"].append(np.stack(metrics))  # shape: L x 4
-            results[f"cluster_labels_{target}"].append(np.stack(labels))  # shape: L x N
-            results[f"t-SNE_embeddings_{target}"].append(np.stack(tsnes))  # L x N x 2
+            results[f"{target}_cluster_labels"].append(np.stack(labels))  # shape: L x N
+            results[f"{target}_cluster_metrics"].append(np.stack(metrics))  # shape: L x 4
+            results[f"{target}_t-SNE_embeddings"].append(np.stack(tsnes))  # shape: L x N x 2
 
     overview_df.to_csv(f"{outdir}/0verview.csv", index_label="sample_idx")
     for key, val in results.items():
@@ -230,15 +230,30 @@ if __name__ == "__main__":
     print("Running experiments...")
     combinations = list(product([None, wikitext, imdb],
                                 ["albert-large-v2", "bert-large-uncased"],
-                                [False, True],
-                                [False, True]))
+                                [False],
+                                [False]))
     for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
         print(f"EXPERIMENT {i + 1}/{len(combinations)}")
         try:
             run_experiment(dataset,
                            model_id,
                            random_params,
-                           no_dense_layers,
-                           num_hidden_layers=72 if model_id == "albert-large-v2" else None)
+                           no_dense_layers)
         except Exception as e:
             print("FAILED:", repr(e))
+
+    # print("Running experiments...")
+    # combinations = list(product([None, wikitext, imdb],
+    #                             ["albert-large-v2", "bert-large-uncased"],
+    #                             [False, True],
+    #                             [False, True]))
+    # for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
+    #     print(f"EXPERIMENT {i + 1}/{len(combinations)}")
+    #     try:
+    #         run_experiment(dataset,
+    #                        model_id,
+    #                        random_params,
+    #                        no_dense_layers,
+    #                        num_hidden_layers=72 if model_id == "albert-large-v2" else None)
+    #     except Exception as e:
+    #         print("FAILED:", repr(e))
