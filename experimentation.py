@@ -59,9 +59,10 @@ def build_model(model_id, random_params, no_dense_layers, num_hidden_layers):
     config = AutoConfig.from_pretrained(model_id)
     if num_hidden_layers:  # override depth (only works for models with shared params)
         config.num_hidden_layers = num_hidden_layers
-    if random_params:  # initialise params randomly
+    if random_params:  # initialise params randomly and use single head
+        config.num_attention_heads = 1
         model = AutoModel.from_config(config)
-    else:
+    else:  # get learnt params
         model = AutoModel.from_pretrained(model_id, config=config)
     if no_dense_layers:  # set dense layer params to zero
         disable_dense_layers(model)
@@ -152,7 +153,7 @@ def compute_clustering(data):
     metrics = []
     for i, X in enumerate(data):
         X = X.astype(np.float64)  # cast to 64-bit floats to avoid numerical issues
-        X = PCA(n_components=64, random_state=RANDOM_SEED).fit_transform(X)
+        X = PCA(n_components=32, random_state=RANDOM_SEED).fit_transform(X)
         clustering = HDBSCAN(min_cluster_size=3).fit(X)
         num_clusters = clustering.labels_.max() + 1
         outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
