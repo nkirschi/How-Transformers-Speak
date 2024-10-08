@@ -4,6 +4,7 @@ import pandas as pd
 import random
 import torch
 import torch.nn.functional as F
+import traceback
 
 from collections import defaultdict
 from datasets import load_dataset
@@ -25,7 +26,6 @@ N: number of tokens
 d: dimensionality of token space
 d': dimensionality of query/key space
 L: number of layers
-H: number of attention heads
 S: sample size
 """
 
@@ -82,6 +82,24 @@ def disable_dense_layers(model):
                     model.encoder.layer[i].attention.output.dense.bias.fill_(0.0)
 
 
+def extract_queries_and_keys(model, head):
+    num_layers = model.config.num_hidden_layers
+    head_ndim = model.config.hidden_size // model.config.num_attention_heads
+    model_type = model.config.model_type
+    head_extractor = lambda layer: (lambda x: layer(x)[..., (head * head_ndim):((head + 1) * head_ndim)])
+    match model_type:
+        case "albert":
+            shared_query = head_extractor(model.encoder.albert_layer_groups[0].albert_layers[0].attention.query)
+            shared_key = head_extractor(model.encoder.albert_layer_groups[0].albert_layers[0].attention.key)
+            return num_layers * [shared_query], num_layers * [shared_key]
+        case "bert":
+            queries = [head_extractor(l.attention.self.query) for l in model.encoder.layer]
+            keys = [head_extractor(l.attention.self.key) for l in model.encoder.layer]
+            return queries, keys
+        case _:
+            raise NotImplementedError("Unsupported model type", model_type)
+
+
 def make_outdir(model, dataset, random_params, no_dense_layers):
     run_id = "randomtext" if dataset is None else dataset.info.dataset_name
     run_id += f"_{model.config._name_or_path}"
@@ -94,7 +112,7 @@ def make_outdir(model, dataset, random_params, no_dense_layers):
 
 
 def get_random_input(dataset, tokeniser):
-    MIN_NUM_TOKENS = 100
+    MIN_NUM_TOKENS = 300
     while True:
         if dataset is not None:
             index = torch.randint(low=0, high=len(dataset), size=(1,)).item()
@@ -118,20 +136,14 @@ def compute_cos_similarities(hidden_states):
     return sim_matrices
 
 
-def compute_attention_logits(attentions):
-    """
-    Obtain the pre-softmax logits up to an additive constant:
-    softmax_i = logit_i /  sum(logits)
-    implies
-    logit_i = log(softmax_i) + C
-    with intractable constant C := log(sum(logits))
-    """
+def compute_attention_logits(hidden_states, queries, keys):
     logit_matrices = []
-    for A in attentions:
-        A = torch.from_numpy(A)  # shape: H x N x N
-        exp_C = A.min(dim=-1)[0] ** -1
-        logit = torch.log(A * exp_C[..., None])  # scale per head and row
-        logit_matrices.append(logit.numpy(force=True))
+    for X, query, key in zip(hidden_states, queries, keys):
+        X = torch.from_numpy(X)  # shape: N x d
+        Q, K = query(X), key(X)  # shape: N x d'
+        factor = K.shape[-1] ** -0.5  # for numerical stability
+        logit_matrix = factor * torch.matmul(Q, K.transpose(0, 1))  # shape: N x N
+        logit_matrices.append(logit_matrix.numpy(force=True))
     return logit_matrices
 
 
@@ -141,11 +153,11 @@ def compute_clustering(data):
     for i, X in enumerate(data):
         X = X.astype(np.float64)  # cast to 64-bit floats to avoid numerical issues
         X = PCA(n_components=64, random_state=RANDOM_SEED).fit_transform(X)
-        clustering = HDBSCAN().fit(X)
+        clustering = HDBSCAN(min_cluster_size=3).fit(X)
         num_clusters = clustering.labels_.max() + 1
         outlier_rate = (clustering.labels_ == -1).sum() / len(clustering.labels_)
         silh_score = silhouette_score(X, clustering.labels_) if num_clusters > 1 else 1.0
-        dbcv_score = validity_index(X, clustering.labels_)
+        dbcv_score = validity_index(X, clustering.labels_) if num_clusters > 1 else 1.0
         labels.append(clustering.labels_)
         metrics.append(np.array([num_clusters, outlier_rate, silh_score, dbcv_score]))
     return labels, metrics
@@ -175,31 +187,32 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
     overview_df = pd.DataFrame(columns=["original_text", "tokenised_text", "num_tokens"])
     results = defaultdict(list)  # non-existent keys are initialised with empty list
 
-    run_pbar = tqdm(range(sample_size), desc="Analysing each sample")
+    run_pbar = tqdm(range(sample_size), desc="Processing each sample")
     for sample_idx in run_pbar:
         # input from dataset
         input, original_text, tokenised_text = get_random_input(dataset, tokeniser)
         overview_df.loc[sample_idx] = (original_text, tokenised_text, input.input_ids.numel())
 
         # output from model
-        output = model(**input, output_hidden_states=True, output_attentions=True)
+        output = model(**input, output_hidden_states=True)
         hidden_states = [X.squeeze(0).numpy(force=True)  # shape: N x d
-                         for X in output.hidden_states[1:]]  # ignore input layer
-        head = random.choice(range(model.config.num_attention_heads))  # choose random attention head
-        attentions = [A.squeeze(0).numpy(force=True)[head]  # shape: H x N x N
-                      for A in output.attentions]
+                         for X in output.hidden_states]  # ignore input layer
 
-        # dotprod matrices
+        # token similarities
         run_pbar.set_postfix_str("dotprods")
-        sim_matrices = compute_cos_similarities(hidden_states)
+        sim_matrices = compute_cos_similarities(hidden_states[1:])
         results[f"token_similarity"].append(np.stack(sim_matrices))  # shape: L x N x N
-        logit_matrices = compute_attention_logits(attentions)
+
+        # attention logits
+        head = random.choice(range(model.config.num_attention_heads))  # choose random attention head
+        queries, keys = extract_queries_and_keys(model, head)
+        logit_matrices = compute_attention_logits(hidden_states[:-1], queries, keys)
         results[f"attention_logits"].append(np.stack(logit_matrices))  # shape: L x N x N
 
         # clustering and t-SNE
         run_pbar.set_postfix_str("clustering")
         for target in ["token", "attention_logit"]:
-            data = hidden_states if target == "X" else logit_matrices
+            data = hidden_states[1:] if target == "X" else logit_matrices
             labels, metrics = compute_clustering(data)
             tsnes = compute_tsne_embeddings(data)
             results[f"{target}_cluster_labels"].append(np.stack(labels))  # shape: L x N
@@ -229,6 +242,7 @@ if __name__ == "__main__":
                            model_id,
                            random_params,
                            no_dense_layers,
-                           num_hidden_layers=72 if model_id == "albert-large-v2" else None)
+                           num_hidden_layers=48 if model_id == "albert-large-v2" else None)
         except Exception as e:
             print("FAILED:", repr(e))
+            print(traceback.format_exc())
