@@ -16,7 +16,10 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
         sim_tensor = np.load(f"rawsults/{run_id}/{target}.npy")
         seq_lens = pd.read_csv(f"rawsults/{run_id}/0verview.csv", index_col=0)["num_tokens"]
         count_tensor = np.stack([np.stack([
-            np.histogram(layer[:seq_lens[i], :seq_lens[i]].flatten(), bins=num_bins, range=(-1, 1), density=True)[0]
+            np.histogram(layer[:seq_lens[i], :seq_lens[i]].flatten(),
+                         bins=num_bins,
+                         density=True,
+                         range=(-1, 1) if target == "token_similarity" else None)[0]
             for layer in sample]) for i, sample in enumerate(sim_tensor)
         ])
         count_mean = np.mean(count_tensor, axis=0)  # shape num_layer x num_bins
@@ -162,7 +165,7 @@ def plot_tsne(run_id):
 
 
 if __name__ == "__main__":
-    run_pbar = tqdm(os.listdir("rawsults/"), desc="Plotting")
+    run_pbar = tqdm(sorted(os.listdir("rawsults/")), desc="Plotting")
     for run_id in run_pbar:
         for plot_fn in [plot_histograms, plot_heatmaps, plot_cluster_sizes, plot_cluster_metrics, plot_tsne]:
             run_pbar.set_postfix_str(plot_fn.__name__)
