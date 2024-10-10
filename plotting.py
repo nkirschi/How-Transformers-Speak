@@ -80,8 +80,8 @@ def plot_heatmaps(run_id):
                     else:
                         plt.imshow(dotprod_matrix, cmap="viridis")
                     plt.colorbar()
-                    plt.xlabel("token j")
-                    plt.ylabel("token i")
+                    plt.xlabel("token $j$")
+                    plt.ylabel("token $i$")
                     plt.title(f"layer {layer + 1}")
                 plt.tight_layout()
                 plt.savefig(f"{outdir}/heatmaps_sample{sample}_layers{layers_to_plot[0]}-{layers_to_plot[-1]}.pdf")
