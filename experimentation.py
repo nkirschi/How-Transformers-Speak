@@ -178,7 +178,6 @@ def run_experiment(dataset, model_id, random_params=False, no_dense_layers=False
     "(token|attention_logit)_cluster_labels.npy": S x L x N
     "(token|attention_logit)_t-SNE_embeddings.npy": S x L x N x 2
     """
-    print(locals())
     seed_everything(RANDOM_SEED)  # ensure reproducibility
 
     model = build_model(model_id, random_params, no_dense_layers, num_hidden_layers)
@@ -233,7 +232,7 @@ if __name__ == "__main__":
 
     print("Running experiments...")
     combinations = list(product([None, wikitext, imdb],
-                                ["albert-large-v2", "bert-large-uncased"],
+                                ["albert-xlarge-v2"], #["albert-large-v2", "bert-large-uncased"],
                                 [False, True],
                                 [False, True]))
     for i, (dataset, model_id, random_params, no_dense_layers) in enumerate(combinations):
@@ -243,7 +242,7 @@ if __name__ == "__main__":
                            model_id,
                            random_params,
                            no_dense_layers,
-                           num_hidden_layers=48 if model_id == "albert-large-v2" else None)
+                           num_hidden_layers=48 if model_id.startswith("albert") else None)
         except Exception as e:
             print("FAILED:", repr(e))
             print(traceback.format_exc())
