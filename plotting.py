@@ -1,3 +1,4 @@
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -6,6 +7,14 @@ import scipy as sp
 
 from matplotlib.ticker import PercentFormatter
 from tqdm import tqdm
+
+TARGET_TITLES = {
+    "token_similarity": r"cos similarity $\langle \frac{x_i}{\lVert x_i \rVert}, \frac{x_j}{\lVert x_j \rVert} \rangle$",
+    "attention_logits": r"attention logits $\frac{1}{\sqrt{d}} \langle Qx_i, Kx_j \rangle$"
+}
+TARGET_TITLES["token"] = TARGET_TITLES["token_similarity"]
+TARGET_TITLES["attention_logit"] = TARGET_TITLES["attention_logits"]
+TITLE_FN = lambda plot, target, run_id: f"{plot} of {TARGET_TITLES[target]}\n($\\texttt{{{run_id}}})$\n"
 
 
 def plot_histograms(run_id, num_bins=100, conf_level=0.99):
@@ -32,7 +41,7 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
         for page in range(num_layers // 24):
             layers_to_plot = range(page * 24, (page + 1) * 24)
             plt.figure(figsize=(12, 16))
-            plt.suptitle(f"{target} histograms\n({run_id})\n")
+            plt.suptitle(TITLE_FN("histograms", target, run_id))
             for i, layer in enumerate(layers_to_plot):
                 plt.subplot(6, 4, i + 1)
                 plt.stairs(count_mean[layer], np.linspace(-1, 1, num_bins + 1))
@@ -41,7 +50,7 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
                                  alpha=0.5, step="mid")
                 plt.xlim(-1, 1)
                 plt.ylim(0, max_density)  # set a consistent y-axis limit
-                plt.title(f"after layer {layer + 1}")
+                plt.title(f"layer {layer + 1}")
             plt.tight_layout()
             plt.savefig(f"{outdir}/histograms_layers{layers_to_plot[0]}-{layers_to_plot[-1]}.pdf")
             plt.close()
@@ -60,7 +69,7 @@ def plot_heatmaps(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(f"{target} heatmaps\n({run_id})\n")
+                plt.suptitle(TITLE_FN("heatmaps", target, run_id))
                 for i, layer in enumerate(layers_to_plot):
                     dotprod_matrix = dotprod_tensor[sample, layer, :seq_lens[sample], :seq_lens[sample]]
                     plt.subplot(6, 4, i + 1)
@@ -71,7 +80,7 @@ def plot_heatmaps(run_id):
                     plt.colorbar(label=f"{target}")
                     plt.xlabel("token j")
                     plt.ylabel("token i")
-                    plt.title(f"after layer {layer + 1}")
+                    plt.title(f"layer {layer + 1}")
                 plt.tight_layout()
                 plt.savefig(f"{outdir}/heatmaps_sample{sample}_layers{layers_to_plot[0]}-{layers_to_plot[-1]}.pdf")
                 plt.close()
@@ -86,7 +95,7 @@ def plot_cluster_metrics(run_id):
 
         for sample in range(metrics_tensor.shape[0]):
             plt.figure(figsize=(6, 6))
-            plt.suptitle(f"HDBSCAN {target} cluster evaluation\n({run_id})\n")
+            plt.suptitle(TITLE_FN("HDBSCAN cluster evaluation", target, run_id))
             for i, title in enumerate(["number of clusters", "outlier rate", "Silhouette score", "DBCV score"]):
                 plt.subplot(2, 2, 1 + i)
                 plt.title(title)
@@ -113,7 +122,7 @@ def plot_cluster_sizes(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(f"HDBSCAN {target} cluster sizes\n({run_id})\n")
+                plt.suptitle(TITLE_FN("HDBSCAN cluster sizes", target, run_id))
                 max_num_clusters = max(max(labels_tensor[sample, layer, :seq_lens[sample]]) + 1
                                        for layer in layers_to_plot)
                 for i, layer in enumerate(layers_to_plot):
@@ -124,7 +133,7 @@ def plot_cluster_sizes(run_id):
                     cluster_sizes = np.sort(cluster_sizes)[::-1]  # sort by decreasing size
                     plt.subplot(6, 4, i + 1)
                     plt.bar(range(1, len(cluster_sizes) + 1), cluster_sizes, color=colours)
-                    plt.title(f"after layer {layer + 1}")
+                    plt.title(f"layer {layer + 1}")
                     plt.xlabel("k-th largest cluster")
                     plt.xticks([1, len(cluster_sizes) + 1])
                     if i % 4 == 0:
@@ -147,7 +156,7 @@ def plot_tsne(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(f"{target} t-SNE embeddings\n({run_id})\n")
+                plt.suptitle(TITLE_FN("t-SNE embeddings", target, run_id))
                 for i, layer in enumerate(layers_to_plot):
                     embeds = tsne_tensor[sample, layer, :seq_lens[sample]]
                     labels = labels_tensor[sample, layer, :seq_lens[sample]]
@@ -156,7 +165,7 @@ def plot_tsne(run_id):
                     labels = [np.where(sorting_idxs == l)[0][0] if l >= 0 else len(cluster_sizes) for l in labels]
                     plt.subplot(6, 4, i + 1)
                     plt.scatter(embeds[:, 0], embeds[:, 1], s=1, c=labels, cmap="viridis")
-                    plt.title(f"after layer {layer + 1}")
+                    plt.title(f"layer {layer + 1}")
                     plt.xlim(-100, 100)
                     plt.ylim(-100, 100)
                 plt.tight_layout()
@@ -165,7 +174,10 @@ def plot_tsne(run_id):
 
 
 if __name__ == "__main__":
-    run_pbar = tqdm(sorted(os.listdir("rawsults/")), desc="Plotting")
+    matplotlib.rc("text", usetex=True)
+    matplotlib.rc("font", **{"family": "serif"})
+    plt.rcParams.update({"text.latex.preamble": r"\usepackage{amsmath}"})
+    run_pbar = tqdm(["imdb_albert-xlarge-v2_params-trained_dense-on_layers-24"])  # tqdm(sorted(os.listdir("rawsults/")), desc="Plotting")
     for run_id in run_pbar:
         for plot_fn in [plot_histograms, plot_heatmaps, plot_cluster_sizes, plot_cluster_metrics, plot_tsne]:
             run_pbar.set_postfix_str(plot_fn.__name__)
