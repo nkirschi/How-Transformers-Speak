@@ -102,7 +102,7 @@ def extract_queries_and_keys(model, head):
 
 
 def make_outdir(model, dataset, random_params, no_dense_layers):
-    run_id = "randomtext" if dataset is None else dataset.info.dataset_name
+    run_id = "uniform" if dataset is None else dataset.info.dataset_name
     run_id += f"_{model.config._name_or_path}"
     run_id += f"_params-{'random' if random_params else 'trained'}"
     run_id += f"_dense-{'off' if no_dense_layers else 'on'}"
