@@ -14,7 +14,9 @@ TARGET_TITLES = {
     "attention_logits": r"attention logits $\frac{1}{\sqrt{d'}} \langle Qx_i, Kx_j \rangle$",
     "attention_logit": r"error functions $\mathcal{E}_i$"
 }
-TITLE_FN = lambda plot, target, run_id: f"{plot} of {TARGET_TITLES[target]}\n($\\texttt{{{run_id}}})$\n"
+TITLE_FN = lambda plot, target, run_id, sample=None: (
+    f"{plot} of {TARGET_TITLES[target]}\n($\\texttt{{{run_id}}}$" + (f", sample {sample}" if sample else "") + ")\n"
+)
 
 
 def plot_histograms(run_id, num_bins=100, conf_level=0.99):
@@ -34,7 +36,7 @@ def plot_histograms(run_id, num_bins=100, conf_level=0.99):
         ])
         count_mean = np.mean(count_tensor, axis=0)  # shape num_layer x num_bins
         t_score = sp.stats.t.ppf(q=1 - (1 - conf_level) / 2, df=count_tensor.shape[0] - 1)
-        count_conf = t_score * np.std(count_tensor, axis=0) / np.sqrt(count_tensor.shape[0])  # t-distribution confidence deviation
+        count_conf = t_score * np.std(count_tensor, axis=0) / np.sqrt(count_tensor.shape[0])
         num_bins = count_tensor.shape[-1]
         max_density = count_tensor.max()
 
@@ -71,7 +73,7 @@ def plot_heatmaps(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(TITLE_FN("Heatmaps", target, run_id))
+                plt.suptitle(TITLE_FN("Heatmaps", target, run_id, sample))
                 for i, layer in enumerate(layers_to_plot):
                     dotprod_matrix = dotprod_tensor[sample, layer, :seq_lens[sample], :seq_lens[sample]]
                     plt.subplot(6, 4, i + 1)
@@ -97,7 +99,7 @@ def plot_cluster_metrics(run_id):
 
         for sample in range(metrics_tensor.shape[0]):
             plt.figure(figsize=(6, 6))
-            plt.suptitle(TITLE_FN("HDBSCAN cluster evaluation", target, run_id))
+            plt.suptitle(TITLE_FN("HDBSCAN cluster evaluation", target, run_id, sample))
             for i, title in enumerate(["number of clusters", "outlier rate", "Silhouette score", "DBCV score"]):
                 plt.subplot(2, 2, 1 + i)
                 plt.title(title)
@@ -127,7 +129,7 @@ def plot_cluster_sizes(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(TITLE_FN("HDBSCAN cluster sizes", target, run_id))
+                plt.suptitle(TITLE_FN("HDBSCAN cluster sizes", target, run_id, sample))
                 max_num_clusters = max(max(labels_tensor[sample, layer, :seq_lens[sample]]) + 1
                                        for layer in layers_to_plot)
                 for i, layer in enumerate(layers_to_plot):
@@ -147,6 +149,7 @@ def plot_cluster_sizes(run_id):
                 plt.savefig(f"{outdir}/cluster_sizes_sample{sample}_layers{layers_to_plot[0]}-{layers_to_plot[-1]}.pdf")
                 plt.close()
 
+
 def plot_tsne(run_id):
     for target in ["token", "attention_logit"]:
         outdir = f"visualisation/{run_id}/{target}_clustering"
@@ -161,7 +164,7 @@ def plot_tsne(run_id):
             for page in range(num_layers // 24):
                 layers_to_plot = range(page * 24, (page + 1) * 24)
                 plt.figure(figsize=(12, 16))
-                plt.suptitle(TITLE_FN("t-SNE embeddings", target, run_id))
+                plt.suptitle(TITLE_FN("t-SNE embeddings", target, run_id, sample))
                 for i, layer in enumerate(layers_to_plot):
                     embeds = tsne_tensor[sample, layer, :seq_lens[sample]]
                     labels = labels_tensor[sample, layer, :seq_lens[sample]]
